@@ -1194,3 +1194,76 @@ async fn test_reaction_on_thread_root_reaches_thread_timeline() {
     assert_eq!(new_events.len(), 1);
     assert_eq!(new_events[0].event_id(), Some(reaction_id));
 }
+
+/// Wait until the event cache knows a `ThreadInfo` for this thread, and return
+/// its number of replies.
+async fn wait_for_thread_info_replies(
+    client: &Client,
+    room_id: &ruma::RoomId,
+    thread_root: &ruma::EventId,
+) -> Option<u32> {
+    for _ in 0..100 {
+        if let Some(thread_info) =
+            client.event_cache().unwrap().thread_info(room_id, thread_root).await.unwrap()
+        {
+            return Some(thread_info.number_of_replies);
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    None
+}
+
+/// A thread root arrives with the server's bundled thread summary (3 replies),
+/// none of the replies in the sync, and with a threaded read receipt for that
+/// thread. The thread's `ThreadInfo` must report the server's 3 replies, not
+/// the number of replies the store happens to hold (zero).
+#[async_test]
+async fn test_receipt_only_thread_keeps_server_reply_count() {
+    use ruma::events::receipt::{ReceiptThread, ReceiptType};
+
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let event_cache = client.event_cache().unwrap();
+    let own_user_id = client.user_id().unwrap();
+
+    let room_id = room_id!("!galette:saucisse.bzh");
+    let thread_root = event_id!("$root");
+    let latest_reply = event_id!("$reply3");
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+
+    let latest_reply_event = f
+        .text_msg("third reply")
+        .in_thread(thread_root, thread_root)
+        .event_id(latest_reply)
+        .into_raw_sync()
+        .cast_unchecked();
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(
+                    f.text_msg("thread root").event_id(thread_root).with_bundled_thread_summary(
+                        latest_reply_event,
+                        3,
+                        false,
+                    ),
+                )
+                .add_receipt(
+                    f.read_receipts()
+                        .add(
+                            latest_reply,
+                            own_user_id,
+                            ReceiptType::Read,
+                            ReceiptThread::Thread(thread_root.to_owned()),
+                        )
+                        .into_event(),
+                ),
+        )
+        .await;
+
+    assert_eq!(wait_for_thread_info_replies(&client, room_id, thread_root).await, Some(3));
+
+    let thread_info = event_cache.thread_info(room_id, thread_root).await.unwrap().unwrap();
+    assert_eq!(thread_info.latest_event.as_deref(), Some(latest_reply));
+}
