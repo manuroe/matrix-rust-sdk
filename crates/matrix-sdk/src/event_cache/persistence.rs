@@ -172,6 +172,11 @@ pub(super) async fn send_updates_to_store(
         return Ok(());
     }
 
+    // The bundled thread summary of a thread root is about to be stripped.
+    // Keep it in the thread's `ThreadInfo`, so the thread root can show its
+    // thread without the thread being loaded.
+    seed_thread_infos_from_bundled_summaries(store, linked_chunk_id.room_id(), &updates).await?;
+
     // Strip relations from updates which insert or replace items.
     //
     // The reason we're doing this, is that consumers of the event cache might
@@ -224,6 +229,51 @@ pub(super) async fn send_updates_to_store(
 
     // Forward that the store got updated to observers.
     linked_chunk_update_sender.send(RoomEventCacheLinkedChunkUpdate { linked_chunk_id, updates });
+
+    Ok(())
+}
+
+/// Record the server's bundled thread summary of thread roots in their
+/// [`ThreadInfo`], if it has more replies than what is already known.
+///
+/// Note: this writes the store directly. A thread cache already in memory keeps
+/// its own copy of the `ThreadInfo` until its next update, which keeps the
+/// larger count.
+async fn seed_thread_infos_from_bundled_summaries(
+    store: &EventCacheStoreLockGuard,
+    room_id: &RoomId,
+    updates: &[Update<Event, Gap>],
+) -> Result<()> {
+    for update in updates {
+        let items: &[Event] = match update {
+            Update::PushItems { items, .. } => items,
+            Update::ReplaceItem { item, .. } => std::slice::from_ref(item),
+            _ => continue,
+        };
+
+        for event in items {
+            let (Some(thread_root), Some(summary)) = (event.event_id(), event.thread_summary())
+            else {
+                continue;
+            };
+
+            let mut thread_info = store
+                .load_thread_info(room_id, thread_root, true)
+                .await?
+                .expect("`insert_default_if_missing` is true, it cannot be `None`");
+
+            if summary.num_replies <= thread_info.number_of_replies {
+                continue;
+            }
+
+            thread_info.number_of_replies = summary.num_replies;
+            if summary.latest_reply.is_some() {
+                thread_info.latest_event = summary.latest_reply;
+            }
+
+            store.update_thread_info(room_id, thread_root, &thread_info).await?;
+        }
+    }
 
     Ok(())
 }

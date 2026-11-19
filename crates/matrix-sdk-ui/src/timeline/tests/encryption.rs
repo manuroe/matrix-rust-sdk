@@ -921,3 +921,58 @@ fn utd_event_with_unsigned(unsigned: serde_json::Value) -> TimelineEvent {
         },
     )
 }
+
+#[async_test]
+async fn test_utd_thread_root_keeps_its_thread_summary() {
+    let room_id = room_id!("!DovneieKSTkdHKpIXy:morpheus.localhost");
+    let (client, server, event_factory) = get_client(room_id, None).await;
+
+    let room = client.get_room(room_id).unwrap();
+    let timeline = room.timeline_builder().build().await.unwrap();
+    let (_, mut stream) = timeline.subscribe_filter_map(Some).await;
+
+    let thread_root = event_id!("$root");
+    let latest_reply = event_factory
+        .text_msg("the latest reply")
+        .sender(user_id!("@bob:example.org"))
+        .in_thread(thread_root, thread_root)
+        .event_id(event_id!("$reply"))
+        .into_raw_sync()
+        .cast_unchecked();
+
+    // An encrypted thread root that can't be decrypted (no room key), with the
+    // server's bundled thread summary.
+    let event = event_factory
+        .event(RoomEncryptedEventContent::new(
+            EncryptedEventScheme::MegolmV1AesSha2(
+                MegolmV1AesSha2ContentInit {
+                    ciphertext: "AwgAEtABPRMavuZMDJrPo6pGQP4qVmpcuapuXtzKXJyi3YpE".to_owned(),
+                    sender_key: "DeHIg4gwhClxzFYcmNntPNF9YtsdZbmMy8+3kzCMXHA".to_owned(),
+                    device_id: "NLAZCWIOCO".into(),
+                    session_id: "gM8i47Xhu0q52xLfgUXzanCMpLinoyVyH7R58cBuVBU".into(),
+                }
+                .into(),
+            ),
+            None,
+        ))
+        .sender(User::Bob)
+        .event_id(thread_root)
+        .with_bundled_thread_summary(latest_reply, 3, false);
+
+    server
+        .mock_sync()
+        .ok_and_run(&client, |builder| {
+            builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(event));
+        })
+        .await;
+
+    let item = assert_next_matches_with_timeout!(stream, VectorDiff::PushBack { value } => value);
+    assert_let!(
+        TimelineItemContent::MsgLike(MsgLikeContent {
+            kind: MsgLikeKind::UnableToDecrypt(_),
+            thread_summary: Some(thread_summary),
+            ..
+        }) = item.as_event().unwrap().content()
+    );
+    assert_eq!(thread_summary.num_replies, 3);
+}

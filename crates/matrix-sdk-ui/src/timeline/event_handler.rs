@@ -289,11 +289,15 @@ impl TimelineAction {
                             .await;
                         }
 
-                        vec![Self::add_item(TimelineItemContent::MsgLike(
-                            MsgLikeContent::unable_to_decrypt(EncryptedMessage::from_content(
+                        // The thread summary is outside the encrypted payload
+                        // (bundled by the server), so keep it: an
+                        // undecryptable thread root can still show its thread.
+                        vec![Self::add_item(TimelineItemContent::MsgLike(MsgLikeContent {
+                            thread_summary,
+                            ..MsgLikeContent::unable_to_decrypt(EncryptedMessage::from_content(
                                 content, utd_cause,
-                            )),
-                        ))]
+                            ))
+                        }))]
                     } else {
                         // If we get here, it means that some part of the code
                         // has created a `TimelineEvent` containing an
