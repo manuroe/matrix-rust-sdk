@@ -1342,3 +1342,84 @@ async fn test_receipt_only_thread_update_pushes_no_gap() {
         "a receipt-only thread update must not push a gap"
     );
 }
+
+/// A threaded read receipt for a thread that isn't loaded, and with no event
+/// in the sync, doesn't create a thread cache. When the thread gets loaded
+/// later, its unread count still takes the receipt into account: the receipt
+/// is reloaded from the state store.
+#[async_test]
+async fn test_receipt_only_unknown_thread_creates_no_thread_cache() {
+    use ruma::events::receipt::{ReceiptThread, ReceiptType};
+
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let event_cache = client.event_cache().unwrap();
+    let own_user_id = client.user_id().unwrap();
+
+    let room_id = room_id!("!galette:saucisse.bzh");
+    let thread_root = event_id!("$root");
+    let reply = event_id!("$reply");
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+
+    server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = event_cache.room(room_id).await.unwrap();
+    let (_, mut room_updates) = room_event_cache.subscribe().await.unwrap();
+
+    // The own user's receipt for a reply in a thread that isn't loaded.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_receipt(
+                f.read_receipts()
+                    .add(
+                        reply,
+                        own_user_id,
+                        ReceiptType::Read,
+                        ReceiptThread::Thread(thread_root.to_owned()),
+                    )
+                    .into_event(),
+            ),
+        )
+        .await;
+
+    // Room updates are handled in order: once this event is in, the receipt
+    // above has been fully handled.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("barrier").event_id(event_id!("$barrier"))),
+        )
+        .await;
+    loop {
+        assert_let_timeout!(Ok(update) = room_updates.recv());
+        if matches!(update, RoomEventCacheUpdate::UpdateTimelineEvents(_)) {
+            break;
+        }
+    }
+
+    // No thread cache was created for the receipt.
+    assert!(event_cache.thread_info(room_id, thread_root).await.unwrap().is_none());
+
+    // The thread is loaded later, and its reply arrives.
+    let (thread, _drop_handles) = event_cache.thread(room_id, thread_root).await.unwrap();
+    let (_, mut thread_updates) = thread.subscribe().await.unwrap();
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("the reply").in_thread(thread_root, thread_root).event_id(reply),
+            ),
+        )
+        .await;
+    loop {
+        assert_let_timeout!(Ok(update) = thread_updates.recv());
+        if matches!(update, ThreadEventCacheUpdate::UpdateTimelineEvents(_)) {
+            break;
+        }
+    }
+
+    // The own user's receipt is on that reply: nothing is unread.
+    assert_eq!(thread.num_unread_messages().await.unwrap(), 0);
+}

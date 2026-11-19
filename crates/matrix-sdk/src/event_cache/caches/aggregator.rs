@@ -200,6 +200,16 @@ pub async fn aggregate_timeline_and_read_receipts_for_threads<'sync, 'state>(
             _ => None,
         })
     {
+        // Don't load or create a thread cache only to carry receipts: the
+        // receipts are already saved in the state store, and a thread cache
+        // created later (when the thread is opened, or when it receives an
+        // event) reloads the own user's receipt from there.
+        if !new_events_by_thread.contains_key(thread_root)
+            && !existing_threads.contains_key(thread_root)
+        {
+            continue;
+        }
+
         // 1. Create an empty `Timeline` if it doesn't exist so that it triggers
         //    the update for this thread in `Caches`. It doesn't inherit the
         //    room's `limited` and `prev_batch`: they describe the room
