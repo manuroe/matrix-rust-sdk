@@ -1267,3 +1267,78 @@ async fn test_receipt_only_thread_keeps_server_reply_count() {
     let thread_info = event_cache.thread_info(room_id, thread_root).await.unwrap().unwrap();
     assert_eq!(thread_info.latest_event.as_deref(), Some(latest_reply));
 }
+
+/// A threaded read receipt alone, in a `limited` room timeline, doesn't make
+/// the thread push a gap holding the room's `prev_batch` token: that token is
+/// for the room timeline, not for the thread.
+#[async_test]
+async fn test_receipt_only_thread_update_pushes_no_gap() {
+    use std::sync::Arc;
+
+    use matrix_sdk::{
+        cross_process_lock::CrossProcessLockConfig,
+        linked_chunk::{ChunkContent, LinkedChunkId},
+        store::StoreConfig,
+    };
+    use matrix_sdk_base::event_cache::store::{EventCacheStore, MemoryStore};
+    use ruma::events::receipt::{ReceiptThread, ReceiptType};
+
+    let event_cache_store = Arc::new(MemoryStore::new());
+    let store_config = StoreConfig::new(CrossProcessLockConfig::multi_process("hodlor"))
+        .event_cache_store(event_cache_store.clone());
+
+    let server = MatrixMockServer::new().await;
+    let client = server
+        .client_builder()
+        .on_builder(|builder| builder.store_config(store_config))
+        .build()
+        .await;
+    let own_user_id = client.user_id().unwrap();
+
+    let room_id = room_id!("!galette:saucisse.bzh");
+    let thread_root = event_id!("$root");
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+
+    server.sync_joined_room(&client, room_id).await;
+
+    // Keep the thread in memory, so its receipts are routed to it.
+    let (thread, _drop_handles) =
+        client.event_cache().unwrap().thread(room_id, thread_root).await.unwrap();
+    let (_, mut thread_updates) = thread.subscribe().await.unwrap();
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("room-prev-batch")
+                .add_receipt(
+                    f.read_receipts()
+                        .add(
+                            event_id!("$reply"),
+                            own_user_id,
+                            ReceiptType::Read,
+                            ReceiptThread::Thread(thread_root.to_owned()),
+                        )
+                        .into_event(),
+                ),
+        )
+        .await;
+
+    // Wait for the thread to process the receipt.
+    loop {
+        assert_let_timeout!(Ok(update) = thread_updates.recv());
+        if matches!(update, ThreadEventCacheUpdate::AddReadReceiptEvent { .. }) {
+            break;
+        }
+    }
+
+    let chunks = event_cache_store
+        .load_all_chunks(LinkedChunkId::Thread(room_id, thread_root))
+        .await
+        .unwrap();
+    assert!(
+        chunks.iter().all(|chunk| !matches!(chunk.content, ChunkContent::Gap(_))),
+        "a receipt-only thread update must not push a gap"
+    );
+}

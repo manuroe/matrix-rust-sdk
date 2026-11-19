@@ -201,12 +201,19 @@ pub async fn aggregate_timeline_and_read_receipts_for_threads<'sync, 'state>(
         })
     {
         // 1. Create an empty `Timeline` if it doesn't exist so that it triggers
-        //    the update for this thread in `Caches`. This is done by
-        //    `default_entry`.
+        //    the update for this thread in `Caches`. It doesn't inherit the
+        //    room's `limited` and `prev_batch`: they describe the room
+        //    timeline, not this thread, and with no events they would make the
+        //    thread push a gap holding the room's token.
         // 2. Accumulate the read receipt event.
         new_events_by_thread
             .entry(thread_root.to_owned())
-            .or_insert_with(default_entry)
+            .or_insert_with(|| {
+                (
+                    Timeline { limited: false, prev_batch: None, events: Vec::new() },
+                    MaybeReceiptEventContent::none(),
+                )
+            })
             .1
             .get_or_insert_with(|| ReceiptEventContent(BTreeMap::new()))
             .insert(read_receipt_event_id.clone(), read_receipt_event.clone());
