@@ -688,10 +688,136 @@ fn handle_thread_read_receipts(c: &mut Criterion) {
     group.finish()
 }
 
+fn handle_own_thread_read_receipts_first_sync(c: &mut Criterion) {
+    // Create a new asynchronous runtime.
+    let runtime = Builder::new_multi_thread()
+        .enable_time()
+        .enable_io()
+        .build()
+        .expect("Failed to create an asynchronous runtime");
+
+    let mut group = c.benchmark_group("Event cache thread read receipts, first sync");
+    group.sample_size(10);
+
+    let room_id = room_id!("!threadedroom:ben.ch");
+
+    for num_threads in [100, 600] {
+        let threads = (0..num_threads)
+            .map(|i| {
+                (
+                    EventId::parse(format!("$unknown-root-{i}")).unwrap(),
+                    EventId::parse(format!("$unknown-reply-{i}")).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // Receipts from our own user, for threads without a cache.
+        let own_user_id: OwnedUserId = User::Default.into();
+        let mut room_updates = thread_receipts_update(
+            &EventFactory::new().room(room_id),
+            room_id,
+            &own_user_id,
+            &threads,
+        );
+
+        // A first sync is limited, and its `prev_batch` is copied to every new
+        // thread cache.
+        let timeline = &mut room_updates.joined.get_mut(room_id).unwrap().timeline;
+        timeline.limited = true;
+        timeline.prev_batch = Some("prev-batch".to_owned());
+
+        group.throughput(Throughput::Elements(num_threads as u64));
+
+        for store_name in ["memory", "SQLite"] {
+            group.bench_function(
+                BenchmarkId::new(
+                    format!("Unknown threads, own receipts[{store_name}]"),
+                    format!("{num_threads} threads"),
+                ),
+                |bencher| {
+                    bencher.to_async(&runtime).iter_batched(
+                        // The setup.
+                        || {
+                            // Use a new client for each iteration, like the
+                            // first sync after a login or a cache clear. The
+                            // thread caches created by one iteration would
+                            // otherwise make the next one handle known threads.
+                            let temp_dir = (store_name == "SQLite").then(|| tempdir().unwrap());
+
+                            // The setup runs inside the runtime, so it can't
+                            // `block_on` directly.
+                            let client = tokio::task::block_in_place(|| {
+                                runtime.handle().block_on(async {
+                                    let event_cache_store = if store_name == "memory" {
+                                        MemoryStore::default().into_event_cache_store()
+                                    } else {
+                                        SqliteEventCacheStore::open(
+                                            temp_dir.as_ref().unwrap().path().join("bench"),
+                                            None,
+                                        )
+                                        .await
+                                        .unwrap()
+                                        .into_event_cache_store()
+                                    };
+
+                                    let state_store = matrix_sdk::MemoryStore::new();
+                                    let mut changes = matrix_sdk::StateChanges::default();
+                                    changes.add_room(RoomInfo::new(room_id, RoomState::Joined));
+                                    state_store.save_changes(&changes).await.unwrap();
+
+                                    MockClientBuilder::new(None)
+                                        .on_builder(|builder| {
+                                            builder
+                                                .with_threading_support(ThreadingSupport::Enabled {
+                                                    with_subscriptions: false,
+                                                })
+                                                .store_config(
+                                                    StoreConfig::new(
+                                                        CrossProcessLockConfig::multi_process(
+                                                            "cross-process-store-locks-holder-name",
+                                                        ),
+                                                    )
+                                                    .state_store(state_store)
+                                                    .event_cache_store(event_cache_store),
+                                                )
+                                        })
+                                        .build()
+                                        .await
+                                })
+                            });
+                            assert_eq!(client.user_id().unwrap(), own_user_id);
+
+                            (client, temp_dir, room_updates.clone())
+                        },
+                        // The routine itself.
+                        |(client, temp_dir, room_updates)| async move {
+                            client
+                                .event_cache()
+                                .unwrap()
+                                .handle_room_updates(room_updates)
+                                .await
+                                .unwrap();
+
+                            // Dropped by criterion inside the runtime, after
+                            // the measurement. The client goes before its store
+                            // directory.
+                            (client, temp_dir)
+                        },
+                        criterion::BatchSize::PerIteration,
+                    )
+                },
+            );
+        }
+    }
+
+    group.finish()
+}
+
 criterion_group! {
     name = event_cache;
     config = Criterion::default();
-    targets = handle_room_updates, find_event_relations, handle_thread_read_receipts, find_latest_event,
+    targets = handle_room_updates, find_event_relations, handle_thread_read_receipts,
+        handle_own_thread_read_receipts_first_sync, find_latest_event,
 }
 
 criterion_main!(event_cache);
